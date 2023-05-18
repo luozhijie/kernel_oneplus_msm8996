@@ -27,14 +27,12 @@
 
 #define EDID_LENGTH 128
 #define DDC_ADDR 0x50
-#define DDC_ADDR2 0x52 /* E-DDC 1.2 - where DisplayID can hide */
 
 #define CEA_EXT	    0x02
 #define VTB_EXT	    0x10
 #define DI_EXT	    0x40
 #define LS_EXT	    0x50
 #define MI_EXT	    0x60
-#define DISPLAYID_EXT 0x70
 
 struct est_timings {
 	u8 t1;
@@ -215,8 +213,6 @@ struct detailed_timing {
 #define DRM_ELD_VER			0
 # define DRM_ELD_VER_SHIFT		3
 # define DRM_ELD_VER_MASK		(0x1f << 3)
-# define DRM_ELD_VER_CEA861D		(2 << 3) /* supports 861D or below */
-# define DRM_ELD_VER_CANNED		(0x1f << 3)
 
 #define DRM_ELD_BASELINE_ELD_LEN	2	/* in dwords! */
 
@@ -265,11 +261,6 @@ struct detailed_timing {
 #define DRM_ELD_MONITOR_NAME_STRING	20	/* offsets 20..(20+mnl-1) inclusive */
 
 #define DRM_ELD_CEA_SAD(mnl, sad)	(20 + (mnl) + 3 * (sad))
-
-/* HDMI 2.0 */
-#define DRM_EDID_3D_INDEPENDENT_VIEW	(1 << 2)
-#define DRM_EDID_3D_DUAL_VIEW		(1 << 1)
-#define DRM_EDID_3D_OSD_DISPARITY	(1 << 0)
 
 struct edid {
 	u8 header[8];
@@ -331,8 +322,9 @@ void drm_edid_to_eld(struct drm_connector *connector, struct edid *edid);
 int drm_edid_to_sad(struct edid *edid, struct cea_sad **sads);
 int drm_edid_to_speaker_allocation(struct edid *edid, u8 **sadb);
 int drm_av_sync_delay(struct drm_connector *connector,
-		      const struct drm_display_mode *mode);
-struct drm_connector *drm_select_eld(struct drm_encoder *encoder);
+		      struct drm_display_mode *mode);
+struct drm_connector *drm_select_eld(struct drm_encoder *encoder,
+				     struct drm_display_mode *mode);
 int drm_load_edid_firmware(struct drm_connector *connector);
 
 int
@@ -349,25 +341,6 @@ drm_hdmi_vendor_infoframe_from_display_mode(struct hdmi_vendor_infoframe *frame,
 static inline int drm_eld_mnl(const uint8_t *eld)
 {
 	return (eld[DRM_ELD_CEA_EDID_VER_MNL] & DRM_ELD_MNL_MASK) >> DRM_ELD_MNL_SHIFT;
-}
-
-/**
- * drm_eld_sad - Get ELD SAD structures.
- * @eld: pointer to an eld memory structure with sad_count set
- */
-static inline const uint8_t *drm_eld_sad(const uint8_t *eld)
-{
-	unsigned int ver, mnl;
-
-	ver = (eld[DRM_ELD_VER] & DRM_ELD_VER_MASK) >> DRM_ELD_VER_SHIFT;
-	if (ver != 2 && ver != 31)
-		return NULL;
-
-	mnl = drm_eld_mnl(eld);
-	if (mnl > 16)
-		return NULL;
-
-	return eld + DRM_ELD_CEA_SAD(mnl, 0);
 }
 
 /**
@@ -407,10 +380,5 @@ static inline int drm_eld_size(const uint8_t *eld)
 {
 	return DRM_ELD_HEADER_BLOCK_SIZE + eld[DRM_ELD_BASELINE_ELD_LEN] * 4;
 }
-
-struct edid *drm_do_get_edid(struct drm_connector *connector,
-	int (*get_edid_block)(void *data, u8 *buf, unsigned int block,
-			      size_t len),
-	void *data);
 
 #endif /* __DRM_EDID_H__ */

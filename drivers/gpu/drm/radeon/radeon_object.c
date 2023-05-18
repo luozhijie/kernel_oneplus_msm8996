@@ -33,7 +33,6 @@
 #include <linux/slab.h>
 #include <drm/drmP.h>
 #include <drm/radeon_drm.h>
-#include <drm/drm_cache.h>
 #include "radeon.h"
 #include "radeon_trace.h"
 
@@ -76,6 +75,7 @@ static void radeon_ttm_bo_destroy(struct ttm_buffer_object *tbo)
 	bo = container_of(tbo, struct radeon_bo, tbo);
 
 	radeon_update_memory_usage(bo, bo->tbo.mem.mem_type, -1);
+	radeon_mn_unregister(bo);
 
 	mutex_lock(&bo->rdev->gem.mutex);
 	list_del_init(&bo->list);
@@ -173,6 +173,17 @@ void radeon_ttm_placement_from_domain(struct radeon_bo *rbo, u32 domain)
 		else
 			rbo->placements[i].lpfn = 0;
 	}
+
+	/*
+	 * Use two-ended allocation depending on the buffer size to
+	 * improve fragmentation quality.
+	 * 512kb was measured as the most optimal number.
+	 */
+	if (rbo->tbo.mem.size > 512 * 1024) {
+		for (i = 0; i < c; i++) {
+			rbo->placements[i].flags |= TTM_PL_FLAG_TOPDOWN;
+		}
+	}
 }
 
 int radeon_bo_create(struct radeon_device *rdev,
@@ -221,39 +232,6 @@ int radeon_bo_create(struct radeon_device *rdev,
 	/* PCI GART is always snooped */
 	if (!(rdev->flags & RADEON_IS_PCIE))
 		bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
-
-	/* Write-combined CPU mappings of GTT cause GPU hangs with RV6xx
-	 * See https://bugs.freedesktop.org/show_bug.cgi?id=91268
-	 */
-	if (rdev->family >= CHIP_RV610 && rdev->family <= CHIP_RV635)
-		bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
-
-#ifdef CONFIG_X86_32
-	/* XXX: Write-combined CPU mappings of GTT seem broken on 32-bit
-	 * See https://bugs.freedesktop.org/show_bug.cgi?id=84627
-	 */
-	bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
-#elif defined(CONFIG_X86) && !defined(CONFIG_X86_PAT)
-	/* Don't try to enable write-combining when it can't work, or things
-	 * may be slow
-	 * See https://bugs.freedesktop.org/show_bug.cgi?id=88758
-	 */
-#ifndef CONFIG_COMPILE_TEST
-#warning Please enable CONFIG_MTRR and CONFIG_X86_PAT for better performance \
-	 thanks to write-combining
-#endif
-
-	if (bo->flags & RADEON_GEM_GTT_WC)
-		DRM_INFO_ONCE("Please enable CONFIG_MTRR and CONFIG_X86_PAT for "
-			      "better performance thanks to write-combining\n");
-	bo->flags &= ~(RADEON_GEM_GTT_WC | RADEON_GEM_GTT_UC);
-#else
-	/* For architectures that don't support WC memory,
-	 * mask out the WC flag from the BO
-	 */
-	if (!drm_arch_can_wc_memory())
-		bo->flags &= ~RADEON_GEM_GTT_WC;
-#endif
 
 	radeon_ttm_placement_from_domain(bo, domain);
 	/* Kernel allocation are uninterruptible */
@@ -434,6 +412,7 @@ void radeon_bo_force_delete(struct radeon_device *rdev)
 	}
 	dev_err(rdev->dev, "Userspace still has active objects !\n");
 	list_for_each_entry_safe(bo, n, &rdev->gem.objects, list) {
+		mutex_lock(&rdev->ddev->struct_mutex);
 		dev_err(rdev->dev, "%p %p %lu %lu force free\n",
 			&bo->gem_base, bo, (unsigned long)bo->gem_base.size,
 			*((unsigned long *)&bo->gem_base.refcount));
@@ -441,7 +420,8 @@ void radeon_bo_force_delete(struct radeon_device *rdev)
 		list_del_init(&bo->list);
 		mutex_unlock(&bo->rdev->gem.mutex);
 		/* this should unref the ttm bo */
-		drm_gem_object_unreference_unlocked(&bo->gem_base);
+		drm_gem_object_unreference(&bo->gem_base);
+		mutex_unlock(&rdev->ddev->struct_mutex);
 	}
 }
 
@@ -522,20 +502,19 @@ int radeon_bo_list_validate(struct radeon_device *rdev,
 			    struct ww_acquire_ctx *ticket,
 			    struct list_head *head, int ring)
 {
-	struct radeon_bo_list *lobj;
-	struct list_head duplicates;
+	struct radeon_cs_reloc *lobj;
+	struct radeon_bo *bo;
 	int r;
 	u64 bytes_moved = 0, initial_bytes_moved;
 	u64 bytes_moved_threshold = radeon_bo_get_threshold_for_moves(rdev);
 
-	INIT_LIST_HEAD(&duplicates);
-	r = ttm_eu_reserve_buffers(ticket, head, true, &duplicates);
+	r = ttm_eu_reserve_buffers(ticket, head, true);
 	if (unlikely(r != 0)) {
 		return r;
 	}
 
 	list_for_each_entry(lobj, head, tv.head) {
-		struct radeon_bo *bo = lobj->robj;
+		bo = lobj->robj;
 		if (!bo->pin_count) {
 			u32 domain = lobj->prefered_domains;
 			u32 allowed = lobj->allowed_domains;
@@ -580,13 +559,13 @@ int radeon_bo_list_validate(struct radeon_device *rdev,
 		lobj->gpu_offset = radeon_bo_gpu_offset(bo);
 		lobj->tiling_flags = bo->tiling_flags;
 	}
-
-	list_for_each_entry(lobj, &duplicates, tv.head) {
-		lobj->gpu_offset = radeon_bo_gpu_offset(lobj->robj);
-		lobj->tiling_flags = lobj->robj->tiling_flags;
-	}
-
 	return 0;
+}
+
+int radeon_bo_fbdev_mmap(struct radeon_bo *bo,
+			     struct vm_area_struct *vma)
+{
+	return ttm_fbdev_mmap(vma, &bo->tbo);
 }
 
 int radeon_bo_get_surface_reg(struct radeon_bo *bo)
@@ -838,23 +817,4 @@ int radeon_bo_wait(struct radeon_bo *bo, u32 *mem_type, bool no_wait)
 	r = ttm_bo_wait(&bo->tbo, true, true, no_wait);
 	ttm_bo_unreserve(&bo->tbo);
 	return r;
-}
-
-/**
- * radeon_bo_fence - add fence to buffer object
- *
- * @bo: buffer object in question
- * @fence: fence to add
- * @shared: true if fence should be added shared
- *
- */
-void radeon_bo_fence(struct radeon_bo *bo, struct radeon_fence *fence,
-                     bool shared)
-{
-	struct reservation_object *resv = bo->tbo.resv;
-
-	if (shared)
-		reservation_object_add_shared_fence(resv, &fence->base);
-	else
-		reservation_object_add_excl_fence(resv, &fence->base);
 }
